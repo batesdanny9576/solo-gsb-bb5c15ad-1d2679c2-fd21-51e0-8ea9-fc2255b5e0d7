@@ -5,16 +5,24 @@
 因此同一份依赖关系在任意历史审计中重现时都会命中同一条复核记录；
 任一节点许可证变化都会改变指纹，旧标记自动不再匹配（条目回到待复核）。
 
-标记的存储、取代（supersede）、撤销与过期判定见 ``database.py``；
-本模块只负责指纹计算与把当前有效标记附着到审计结果上（纯内存操作，
-不改写已持久化的审计 JSON，因此原始冲突、严重程度与两次审计对比
-完全不受影响）。
+指纹采用带版本前缀的「定长前缀 + JSON 四元组」编码（v2）：先写 4 字节
+小端长度再写 UTF-8 JSON 文本，字段边界由长度前缀而非分隔符承担，故节点
+id / 许可证 token 内含 ``|`` 等字符时不会发生跨字段串用（旧 v1 直接以
+``|`` 拼接五个字段，``a@1|b@1`` / ``c@1`` 与 ``a@1`` / ``b@1|c@1``
+会得到同一指纹）。
+
+标记的存储、取代（supersede）、撤销、过期判定与旧指纹迁移见
+``database.py``；本模块只负责指纹计算与把当前有效标记附着到审计结果上
+（纯内存操作，不改写已持久化的审计 JSON，因此原始冲突、严重程度与
+两次审计对比完全不受影响）。
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 import re
+import struct
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,9 +32,20 @@ from . import database
 PENDING = "pending"    # 待复核：无有效标记（从未标记 / 许可证变更 / 过期 / 撤销）
 REVIEWED = "reviewed"  # 已复核：存在指纹一致且未过期、未撤销的最新标记
 
-_FINGERPRINT_VERSION = "v1"
-_SEP = "|"
+# 指纹版本：v1 为旧的 "|" 拼接（存在字段边界串用问题）；
+# v2 改为保留字段边界的定长前缀编码。
+FINGERPRINT_VERSION = "v2"
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _encode_parts(parts: Tuple[str, str, str, str]) -> bytes:
+    """把四字段编码为保留字段边界的字节串：4 字节小端长度 + UTF-8 JSON。
+
+    JSON 对每个字符串整体转义，长度前缀给出整体边界，分隔/引号等字符
+    全部作为字段内容存在，无法跨字段重组。
+    """
+    payload = json.dumps(list(parts), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return FINGERPRINT_VERSION.encode("ascii") + struct.pack("<I", len(payload)) + payload
 
 
 def conflict_fingerprint(
@@ -35,11 +54,13 @@ def conflict_fingerprint(
     ancestor_license_token: str,
     node_license_token: str,
 ) -> str:
-    """由祖先节点、被依赖节点与双方规范化许可证 token 计算稳定指纹。"""
-    raw = _SEP.join(
-        [_FINGERPRINT_VERSION, ancestor, node, ancestor_license_token, node_license_token]
-    )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    """由祖先节点、被依赖节点与双方规范化许可证 token 计算稳定指纹。
+
+    编码保留四字段边界：任一字段内含 ``|``、引号等字符都不会与其他
+    字段切分方式混淆，故不同四字段身份必得不同指纹。
+    """
+    raw = _encode_parts((ancestor, node, ancestor_license_token, node_license_token))
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _node_tokens(result: Dict[str, Any]) -> Dict[str, str]:
@@ -102,8 +123,16 @@ def attach_reviews(result: Dict[str, Any]) -> Dict[str, Any]:
     """
     conflicts: List[Dict[str, Any]] = result.get("conflicts") or []
     tokens = _node_tokens(result)
-    fingerprints = [fingerprint_for_conflict(result, c, tokens) for c in conflicts]
-    marks = database.active_review_map(fingerprints)
+    # 指纹 -> 四字段身份：读取标记时按指纹 + 四字段双重核对，
+    # 即便指纹列残留旧编码的串用值，也不会把标记附到另一条身份上。
+    identities: Dict[str, Tuple[str, str, str, str]] = {}
+    fingerprints: List[str] = []
+    for conflict in conflicts:
+        parts = fingerprint_parts(result, conflict, tokens)
+        fingerprint = conflict_fingerprint(*parts)
+        fingerprints.append(fingerprint)
+        identities.setdefault(fingerprint, parts)
+    marks = database.active_review_map(identities)
 
     reviewed = 0
     for conflict, fingerprint in zip(conflicts, fingerprints):

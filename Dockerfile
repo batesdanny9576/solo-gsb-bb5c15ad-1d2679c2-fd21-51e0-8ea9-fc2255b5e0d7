@@ -18,5 +18,6 @@ VOLUME ["/data"]
 
 EXPOSE 8000
 
-# 容器启动即初始化 SQLite（建库建表），随后启动服务
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 一键启动：先在事务内完成 SQLite 建表与复核指纹迁移（幂等，可重复执行），
+# 依赖已在构建期安装；初始化成功后再启动对外服务。
+CMD ["sh", "-c", "python -c 'from app import database; database.init_db()' && uvicorn app.main:app --host 0.0.0.0 --port 8000"]

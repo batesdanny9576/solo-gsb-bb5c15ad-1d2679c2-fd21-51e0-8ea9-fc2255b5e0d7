@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS reviews (
 
 CREATE INDEX IF NOT EXISTS idx_reviews_fingerprint ON reviews(fingerprint);
 CREATE INDEX IF NOT EXISTS idx_reviews_status ON reviews(status);
+
+-- 轻量迁移账本：记录已在本库执行过的一次性迁移（幂等，可重复执行）。
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key        TEXT PRIMARY KEY,
+    value      TEXT NOT NULL,
+    applied_at TEXT NOT NULL
+);
 """
 
 # 复核标记状态（存储层）
@@ -78,16 +85,21 @@ REVIEW_EXPIRED = "expired"
 
 _REVIEW_STATES = (REVIEW_ACTIVE, REVIEW_SUPERSEDED, REVIEW_REVOKED, REVIEW_EXPIRED)
 
+# 指纹迁移：旧记录按保存的四字段身份重算为保留字段边界的版本化指纹。
+_FP_MIGRATION_KEY = "review_fingerprint_version"
+_FP_MIGRATION_VALUE = "v2"
+
 
 def get_db_path() -> Path:
     return DB_PATH
 
 
 def init_db() -> None:
-    """启动时调用：确保目录与数据库文件存在并完成建表。"""
+    """启动时调用：确保目录与数据库文件存在，建表并在同一事务内完成迁移。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.executescript(_SCHEMA)
+        _migrate_review_fingerprints(conn)
         conn.commit()
 
 
@@ -96,6 +108,47 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def _migrate_review_fingerprints(conn: sqlite3.Connection) -> bool:
+    """把旧复核记录的指纹按其保存的四字段身份重算为当前版本化指纹。
+
+    在单个事务内执行（由 :func:`init_db` 随建表一起提交），可重复执行：
+
+    - 已迁移过（``schema_meta`` 记录了版本）则直接跳过；
+    - 否则逐条读取 ancestor / node / ancestor_license / node_license
+      四列，用当前 ``reviews.conflict_fingerprint`` 重算指纹，仅在值
+      变化时更新 fingerprint 一列；
+    - 记录 id、备注、失效/创建/更新/撤销时间与 status 全部原样保留
+      （不恢复 revoked / 已过期 / superseded 记录），审计 JSON 不触碰。
+
+    旧 v1 编码用 ``|`` 拼接五字段，曾让不同四字段身份（如
+    ``a@1|b@1``+``c@1`` 与 ``a@1``+``b@1|c@1``）共享同一指纹；按四字段
+    重算后两身份各得各的 v2 指纹，原本的串用即解除。
+    """
+    # 延迟导入避免 database <-> reviews 循环导入
+    from . import reviews
+
+    applied = conn.execute(
+        "SELECT value FROM schema_meta WHERE key = ?", (_FP_MIGRATION_KEY,)
+    ).fetchone()
+    if applied is not None:
+        return False
+    rows = conn.execute(
+        "SELECT id, fingerprint, ancestor, node, ancestor_license, node_license "
+        "FROM reviews"
+    ).fetchall()
+    for row in rows:
+        new_fp = reviews.conflict_fingerprint(
+            row["ancestor"], row["node"], row["ancestor_license"], row["node_license"]
+        )
+        if new_fp != row["fingerprint"]:
+            conn.execute("UPDATE reviews SET fingerprint = ? WHERE id = ?", (new_fp, row["id"]))
+    conn.execute(
+        "INSERT INTO schema_meta (key, value, applied_at) VALUES (?, ?, ?)",
+        (_FP_MIGRATION_KEY, _FP_MIGRATION_VALUE, utcnow()),
+    )
+    return True
 
 
 def save_audit(result: Dict[str, Any], raw_manifest: Any) -> int:
@@ -262,12 +315,26 @@ def save_review(
     note: str = "",
     expires_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """创建复核标记；同一指纹的旧有效标记自动转为 superseded（保留历史）。"""
+    """创建复核标记；同一四字段身份的旧有效标记自动转为 superseded（保留历史）。
+
+    取代按 指纹 + 祖先 + 被依赖节点 + 双方许可证 五列同时匹配，确保
+    不同身份（即使历史上因旧编码共享过指纹）不会互相取代。
+    """
     now = utcnow()
     with connect() as conn:
         conn.execute(
-            "UPDATE reviews SET status = ?, updated_at = ? WHERE fingerprint = ? AND status = ?",
-            (REVIEW_SUPERSEDED, now, fingerprint, REVIEW_ACTIVE),
+            """
+            UPDATE reviews
+               SET status = ?, updated_at = ?
+             WHERE fingerprint = ? AND status = ?
+               AND ancestor = ? AND node = ?
+               AND ancestor_license = ? AND node_license = ?
+            """,
+            (
+                REVIEW_SUPERSEDED, now,
+                fingerprint, REVIEW_ACTIVE,
+                ancestor, node, ancestor_license, node_license,
+            ),
         )
         cur = conn.execute(
             """
@@ -356,13 +423,27 @@ def revoke_review(review_id: int) -> Optional[Dict[str, Any]]:
     return get_review(review_id)
 
 
-def active_review_map(fingerprints: Any) -> Dict[str, Dict[str, Any]]:
-    """给定一组指纹，返回 {指纹: 当前有效标记}（未过期且未撤销）。
+def active_review_map(
+    identities: Any,
+) -> Dict[str, Dict[str, Any]]:
+    """给定 ``{指纹: (ancestor, node, ancestor_license, node_license)}``，
+    返回 {指纹: 当前有效标记}（未过期且未撤销）。
 
-    同一指纹至多一条 active 记录（创建新标记时旧记录已被 superseded），
-    因此查询结果即“最新有效标记”。
+    匹配时除指纹外还逐列核对四字段身份：只有五列全部一致才命中，
+    避免不同身份因旧编码串用或哈希碰撞共享标记。同一身份至多一条
+    active 记录（创建新标记时旧记录已被 superseded），因此查询结果即
+    “最新有效标记”。
+
+    为兼容直接传入指纹序列的调用方，缺省身份仅按指纹核对。
     """
-    fps = [fp for fp in {str(f) for f in fingerprints} if fp]
+    id_by_fp: Dict[str, Optional[tuple]] = {}
+    if hasattr(identities, "items"):
+        for fp, parts in identities.items():
+            id_by_fp[str(fp)] = tuple(parts)
+    else:
+        for fp in {str(f) for f in identities}:
+            id_by_fp.setdefault(fp, None)
+    fps = [fp for fp in id_by_fp if fp]
     if not fps:
         return {}
     now = utcnow()
@@ -378,5 +459,13 @@ def active_review_map(fingerprints: Any) -> Dict[str, Dict[str, Any]]:
                 [REVIEW_ACTIVE, *batch, now],
             ).fetchall()
             for row in rows:
-                marks[row["fingerprint"]] = _review_dict(row, now)
+                fp = row["fingerprint"]
+                expected = id_by_fp.get(fp)
+                if expected is not None and (
+                    row["ancestor"], row["node"],
+                    row["ancestor_license"], row["node_license"],
+                ) != expected:
+                    # 指纹相同但四字段身份不同（旧记录串用/碰撞）：不附着
+                    continue
+                marks[fp] = _review_dict(row, now)
     return marks
