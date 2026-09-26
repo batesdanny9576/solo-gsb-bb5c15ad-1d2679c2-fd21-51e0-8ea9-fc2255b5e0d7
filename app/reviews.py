@@ -5,6 +5,14 @@
 因此同一份依赖关系在任意历史审计中重现时都会命中同一条复核记录；
 任一节点许可证变化都会改变指纹，旧标记自动不再匹配（条目回到待复核）。
 
+指纹采用**保留字段边界的版本化编码**（v2：四个字段按 JSON 数组序列化后再做
+SHA-256）。节点 id 或许可证 token 中可能含有竖线等字符，简单的竖线拼接会让
+不同四元组（如 祖先 ``a@1|b@1``/节点 ``c@1`` 与 祖先 ``a@1``/节点 ``b@1|c@1``，
+双方许可证又相同）拼出完全相同的串，复核其中一条会让另一条误显已复核；
+JSON 数组编码保留每个字段的边界，四个字段共同确定唯一身份，创建、取代与
+读取标记均按此四字段身份隔离。旧库中 v1 指纹的标记由 ``database`` 在启动时
+按记录保存的四字段重算迁移。
+
 标记的存储、取代（supersede）、撤销与过期判定见 ``database.py``；
 本模块只负责指纹计算与把当前有效标记附着到审计结果上（纯内存操作，
 不改写已持久化的审计 JSON，因此原始冲突、严重程度与两次审计对比
@@ -14,6 +22,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -24,9 +33,29 @@ from . import database
 PENDING = "pending"    # 待复核：无有效标记（从未标记 / 许可证变更 / 过期 / 撤销）
 REVIEWED = "reviewed"  # 已复核：存在指纹一致且未过期、未撤销的最新标记
 
-_FINGERPRINT_VERSION = "v1"
-_SEP = "|"
+# 指纹编码版本：v2 起为保留字段边界的 JSON 数组编码（v1 为竖线拼接，
+# 字段内含 '|' 时不同四元组会撞指纹；旧记录由启动迁移按四字段重算）。
+_FINGERPRINT_VERSION = "v2"
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def fingerprint_payload(
+    ancestor: str,
+    node: str,
+    ancestor_license_token: str,
+    node_license_token: str,
+) -> str:
+    """指纹输入的版本化编码：JSON 数组序列化，保留四个字段的边界。
+
+    字段中即使含有竖线等分隔符，序列化后仍与相邻字段严格区分，
+    不同的四元组必然得到不同的编码串；同一四元组的编码串恒定，
+    因此同一依赖关系跨审计仍命中同一指纹。
+    """
+    return json.dumps(
+        [_FINGERPRINT_VERSION, ancestor, node, ancestor_license_token, node_license_token],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def conflict_fingerprint(
@@ -36,9 +65,7 @@ def conflict_fingerprint(
     node_license_token: str,
 ) -> str:
     """由祖先节点、被依赖节点与双方规范化许可证 token 计算稳定指纹。"""
-    raw = _SEP.join(
-        [_FINGERPRINT_VERSION, ancestor, node, ancestor_license_token, node_license_token]
-    )
+    raw = fingerprint_payload(ancestor, node, ancestor_license_token, node_license_token)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 

@@ -84,11 +84,14 @@ def get_db_path() -> Path:
 
 
 def init_db() -> None:
-    """启动时调用：确保目录与数据库文件存在并完成建表。"""
+    """启动时调用：确保目录与数据库文件存在，完成建表与复核标记指纹迁移。"""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with connect() as conn:
         conn.executescript(_SCHEMA)
         conn.commit()
+    # 旧库复核标记按记录保存的四字段重算指纹（v1 竖线拼接 → v2 边界保留编码）；
+    # 迁移在事务内执行、幂等可重复，详见 migrate_review_fingerprints。
+    migrate_review_fingerprints()
 
 
 def connect() -> sqlite3.Connection:
@@ -380,3 +383,55 @@ def active_review_map(fingerprints: Any) -> Dict[str, Dict[str, Any]]:
             for row in rows:
                 marks[row["fingerprint"]] = _review_dict(row, now)
     return marks
+
+
+# --- 复核标记指纹迁移 ---------------------------------------------------------
+
+
+def migrate_review_fingerprints() -> int:
+    """按 reviews 表记录保存的四字段重算指纹（边界保留的版本化编码）。
+
+    旧版本指纹由竖线拼接生成，字段内含 ``|`` 时不同四元组会撞出相同指纹
+    （跨审计复核串用）。本迁移在**单个事务**内对每条记录用当前编码重算
+    指纹并按需更新，可重复执行（再次运行通常返回 0）：
+
+    - 只更新 ``fingerprint`` 列：记录 id、备注、创建/更新/撤销时间与
+      状态（active / superseded / revoked）全部原样保留；
+    - 不恢复已撤销、过期或被取代的记录（``status`` 一律不动）；
+    - 不触碰 manifests 表中的审计 JSON。
+
+    返回本次实际更新的记录数。
+    """
+    # 函数级导入，避免与 reviews 模块形成模块级循环依赖
+    from . import reviews as reviews_mod
+
+    migrated = 0
+    conn = connect()
+    try:
+        conn.execute("BEGIN")
+        rows = conn.execute(
+            """
+            SELECT id, fingerprint, ancestor, node, ancestor_license, node_license
+            FROM reviews
+            """
+        ).fetchall()
+        for row in rows:
+            recomputed = reviews_mod.conflict_fingerprint(
+                row["ancestor"],
+                row["node"],
+                row["ancestor_license"],
+                row["node_license"],
+            )
+            if recomputed != row["fingerprint"]:
+                conn.execute(
+                    "UPDATE reviews SET fingerprint = ? WHERE id = ?",
+                    (recomputed, row["id"]),
+                )
+                migrated += 1
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return migrated

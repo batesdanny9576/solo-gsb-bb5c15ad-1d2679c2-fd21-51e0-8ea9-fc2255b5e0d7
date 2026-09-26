@@ -34,7 +34,7 @@ SAMPLE_CYCLONEDX_PATH = STATIC_DIR / "examples" / "sample-cyclonedx.json"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时初始化 SQLite（建库建表）
+    # 启动时初始化 SQLite（建库建表 + 旧复核标记指纹迁移，迁移幂等）
     database.init_db()
     yield
 
